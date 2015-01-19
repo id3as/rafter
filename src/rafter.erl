@@ -20,15 +20,15 @@ stop_node(Peer) ->
 %% @doc Run an operation on the backend state machine.
 %% Note: Peer is just the local node in production.
 op(Peer, Command) ->
-    Id = druuid:v4(),
+    Id = uuid:get_v4(),
     rafter_consensus_fsm:op(Peer, {Id, Command}).
 
 read_op(Peer, Command) ->
-    Id = druuid:v4(),
+    Id = uuid:get_v4(),
     rafter_consensus_fsm:read_op(Peer, {Id, Command}).
 
 set_config(Peer, NewServers) ->
-    Id = druuid:v4(),
+    Id = uuid:get_v4(),
     rafter_consensus_fsm:set_config(Peer, {Id, NewServers}).
 
 -spec get_leader(peer()) -> peer() | undefined.
