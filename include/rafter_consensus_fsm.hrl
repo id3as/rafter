@@ -41,8 +41,8 @@
     %% Keyed on send_clock, Val = [#client_req{}]
     read_reqs = orddict:new() :: orddict:orddict(),
 
-    %% Peers that have timed out
-    timed_out_peers = sets:new() :: sets:set(),
+    %% Peers that have heart-beated
+    live_peers = sets:new() :: sets:set(),
 
     %% Notififcation support
     notification_module :: atom(),

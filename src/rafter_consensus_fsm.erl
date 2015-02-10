@@ -97,6 +97,7 @@ handle_sync_event(_Event, _From, _StateName, State) ->
 
 handle_info({client_read_timeout, Clock, Id}, StateName,
     #state{read_reqs=Reqs}=State) ->
+        io:format("client read timeout~n"),
         TrackedState = timeout_peer(Id, State),
         ClientRequests = orddict:fetch(Clock, Reqs),
         {ok, ClientReq} = find_client_req(Id, ClientRequests),
@@ -107,14 +108,15 @@ handle_info({client_read_timeout, Clock, Id}, StateName,
         {next_state, StateName, NewState};
 
 handle_info({client_timeout, Id}, StateName, #state{client_reqs=Reqs}=State) ->
-    TrackedState = timeout_peer(Id, State),
+    io:format("client timeout~n"),
     case find_client_req(Id, Reqs) of
         {ok, ClientReq} ->
+            TrackedState = timeout_peer(Id, State),
             send_client_timeout_reply(ClientReq),
             NewState = TrackedState#state{client_reqs=delete_client_req(Id, Reqs)},
             {next_state, StateName, NewState};
         not_found ->
-            {next_state, StateName, TrackedState}
+            {next_state, StateName, State}
     end;
 handle_info(_, _, State) ->
     {stop, badmsg, State}.
@@ -360,9 +362,10 @@ leader(timeout, #state{term=Term, init_config=[Id, From], config=C}=S) ->
     NewState = State#state{init_config=complete},
     {next_state, leader, NewState};
 
+%% heartbeat the nodes
 leader(timeout, State0) ->
     State = reset_timer(heartbeat_timeout(), State0),
-    NewState = send_append_entries(State),
+    NewState = heartbeat(State),
     {next_state, leader, NewState};
 
 %% We are out of date. Go back to follower state.
@@ -547,6 +550,9 @@ save_read_request(ReadRequest, #state{send_clock=Clock,
                 orddict:store(Clock, [ReadRequest], Requests)
         end,
         State#state{read_reqs=NewRequests}.
+
+heartbeat(State=#state{}) ->
+    send_append_entries(State).
 
 send_client_timeout_reply(#client_req{from=From}) ->
     gen_fsm:reply(From, {error, timeout}).
@@ -851,7 +857,7 @@ become_leader(#state{me=Me, term=Term, init_config=InitConfig}=State) ->
     NewState = State#state{leader=Me,
                            responses=dict:new(),
                            followers=initialize_followers(State),
-                           timed_out_peers=sets:new(),
+                           live_peers=sets:new(),
                            send_clock = 0,
                            send_clock_responses = dict:new(),
                            read_reqs = orddict:new()},
@@ -958,20 +964,21 @@ reset_timer(Duration, State=#state{timer=Timer}) ->
     NewTimer = gen_fsm:send_event_after(Duration, timeout),
     State#state{timer=NewTimer}.
 
-timeout_peer(PeerId, State = #state{timed_out_peers=Set}) ->
-  NewSet = sets:add_element(PeerId, Set),
-  notify_peers_state_changed(Set, NewSet, State),
-  State#state{timed_out_peers=NewSet}.
-
-live_peer(PeerId, State = #state{timed_out_peers=Set}) ->
+timeout_peer(PeerId, State = #state{live_peers=Set}) ->
+  io:format("Timeout ~p~n", [PeerId]),
   NewSet = sets:del_element(PeerId, Set),
   notify_peers_state_changed(Set, NewSet, State),
-  State#state{timed_out_peers=NewSet}.
+  State#state{live_peers=NewSet}.
 
-remove_legacy_peers(RemovedPeerSet, State = #state{timed_out_peers=Set}) ->
+live_peer(PeerId, State = #state{live_peers=Set}) ->
+  NewSet = sets:add_element(PeerId, Set),
+  notify_peers_state_changed(Set, NewSet, State),
+  State#state{live_peers=NewSet}.
+
+remove_legacy_peers(RemovedPeerSet, State = #state{live_peers=Set}) ->
   NewSet = sets:subtract(Set, RemovedPeerSet),
   notify_peers_state_changed(Set, NewSet, State),
-  State#state{timed_out_peers=NewSet}.
+  State#state{live_peers=NewSet}.
 
 notify_peers_state_changed(_OldPeerList, _NewPeerList, #state{notification_module=undefined}) ->
   ok;
@@ -983,9 +990,9 @@ notify_peers_state_changed(_OldPeerList, NewPeerList, State=#state{notification_
   NotificationModule:peer_availability_changed(FollowerStates),
   ok.
 
-get_follower_states(#state{followers=Followers}, TimedOutPeers) ->
+get_follower_states(#state{followers=Followers}, LivePeers) ->
   dict:map(fun(Id, _) ->
-               sets:is_element(Id, TimedOutPeers)
+               sets:is_element(Id, LivePeers)
            end,
            Followers).
 
