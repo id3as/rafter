@@ -58,7 +58,7 @@ send_sync(To, Msg) ->
 %% gen_fsm callbacks
 %%=============================================================================
 
-init([Me, #rafter_opts{state_machine=StateMachine}]) ->
+init([Me, #rafter_opts{notification_module=NotificationModule, state_machine=StateMachine}]) ->
     Timer = gen_fsm:send_event_after(election_timeout(), timeout),
     #meta{voted_for=VotedFor, term=Term} = rafter_log:get_metadata(Me),
     BackendState = StateMachine:init(Me),
@@ -69,6 +69,7 @@ init([Me, #rafter_opts{state_machine=StateMachine}]) ->
                    followers=dict:new(),
                    timer=Timer,
                    state_machine=StateMachine,
+                   notification_module=NotificationModule,
                    backend_state=BackendState},
     Config = rafter_log:get_config(Me),
     NewState =
@@ -96,22 +97,24 @@ handle_sync_event(_Event, _From, _StateName, State) ->
 
 handle_info({client_read_timeout, Clock, Id}, StateName,
     #state{read_reqs=Reqs}=State) ->
+        TrackedState = timeout_peer(Id, State),
         ClientRequests = orddict:fetch(Clock, Reqs),
         {ok, ClientReq} = find_client_req(Id, ClientRequests),
         send_client_timeout_reply(ClientReq),
         NewClientRequests = delete_client_req(Id, ClientRequests),
         NewReqs = orddict:store(Clock, NewClientRequests, Reqs),
-        NewState = State#state{read_reqs=NewReqs},
+        NewState = TrackedState#state{read_reqs=NewReqs},
         {next_state, StateName, NewState};
 
 handle_info({client_timeout, Id}, StateName, #state{client_reqs=Reqs}=State) ->
+    TrackedState = timeout_peer(Id, State),
     case find_client_req(Id, Reqs) of
         {ok, ClientReq} ->
             send_client_timeout_reply(ClientReq),
-            NewState = State#state{client_reqs=delete_client_req(Id, Reqs)},
+            NewState = TrackedState#state{client_reqs=delete_client_req(Id, Reqs)},
             {next_state, StateName, NewState};
         not_found ->
-            {next_state, StateName, State}
+            {next_state, StateName, TrackedState}
     end;
 handle_info(_, _, State) ->
     {stop, badmsg, State}.
@@ -188,7 +191,7 @@ follower({set_config, {Id, NewServers}}, From,
           #state{me=Me, followers=F, config=#config{state=blank}=C}=State) ->
     case lists:member(Me, NewServers) of
         true ->
-            {Followers, Config} = reconfig(Me, F, C, NewServers, State),
+            {Followers, _RemovedFollowers, Config} = reconfig(Me, F, C, NewServers, State),
             NewState = State#state{config=Config, followers=Followers,
                                    init_config=[Id, From]},
             %% Transition to candidate state. Once we are elected leader we will
@@ -378,9 +381,10 @@ leader(#append_entries_rpy{from=From, success=false},
        #state{followers=Followers, config=C, me=Me}=State) ->
        case lists:member(From, rafter_config:followers(Me, C)) of
            true ->
+               TrackedState = live_peer(From, State),
                NextIndex = decrement_follower_index(From, Followers),
                NewFollowers = dict:store(From, NextIndex, Followers),
-               NewState = State#state{followers=NewFollowers},
+               NewState = TrackedState#state{followers=NewFollowers},
                {next_state, leader, NewState};
            false ->
                %% This is a reply from a previous configuration. Ignore it.
@@ -392,7 +396,8 @@ leader(#append_entries_rpy{from=From, success=true}=Rpy,
        #state{followers=Followers, config=C, me=Me}=State) ->
     case lists:member(From, rafter_config:followers(Me, C)) of
         true ->
-            NewState = save_rpy(Rpy, State),
+            TrackedState = live_peer(From, State),
+            NewState = save_rpy(Rpy, TrackedState),
             State2 = maybe_commit(NewState),
             State3 = maybe_send_read_replies(State2),
             case State3#state.leader of
@@ -440,10 +445,11 @@ leader({set_config, {Id, NewServers}}, From,
        #state{me=Me, followers=F, term=Term, config=C}=State) ->
     case rafter_config:allow_config(C, NewServers) of
         true ->
-            {Followers, Config} = reconfig(Me, F, C, NewServers, State),
+            {Followers, RemovedFollowers, Config} = reconfig(Me, F, C, NewServers, State),
+            NewState0 = remove_legacy_peers(RemovedFollowers, State),
             Entry = #rafter_entry{type=config, term=Term, cmd=Config},
-            NewState0 = State#state{config=Config, followers=Followers},
-            NewState = append(Id, From, Entry, NewState0, leader),
+            NewState1 = NewState0#state{config=Config, followers=Followers},
+            NewState = append(Id, From, Entry, NewState1, leader),
             {next_state, leader, NewState};
         Error ->
             {reply, Error, leader, State}
@@ -472,7 +478,7 @@ no_leader_error(Me, Config) ->
             election_in_progress
     end.
 
--spec reconfig(term(), dict:dict(), #config{}, list(), #state{}) -> {dict:dict(), #config{}}.
+-spec reconfig(term(), dict:dict(), #config{}, list(), #state{}) -> {dict:dict(), sets:set(), #config{}}.
 reconfig(Me, OldFollowers, Config0, NewServers, State) ->
     Config = rafter_config:reconfig(Config0, NewServers),
     NewFollowers = rafter_config:followers(Me, Config),
@@ -482,7 +488,7 @@ reconfig(Me, OldFollowers, Config0, NewServers, State) ->
     RemovedServers = sets:to_list(sets:subtract(OldSet, NewSet)),
     Followers0 = add_followers(AddedServers, OldFollowers, State),
     Followers = remove_followers(RemovedServers, Followers0),
-    {Followers, Config}.
+    {Followers, RemovedServers, Config}.
 
 -spec add_followers(list(), dict:dict(), #state{}) -> dict:dict().
 add_followers(NewServers, Followers, #state{me=Me}) ->
@@ -845,6 +851,7 @@ become_leader(#state{me=Me, term=Term, init_config=InitConfig}=State) ->
     NewState = State#state{leader=Me,
                            responses=dict:new(),
                            followers=initialize_followers(State),
+                           timed_out_peers=sets:new(),
                            send_clock = 0,
                            send_clock_responses = dict:new(),
                            read_reqs = orddict:new()},
@@ -950,6 +957,37 @@ reset_timer(Duration, State=#state{timer=Timer}) ->
     _ = gen_fsm:cancel_timer(Timer),
     NewTimer = gen_fsm:send_event_after(Duration, timeout),
     State#state{timer=NewTimer}.
+
+timeout_peer(PeerId, State = #state{timed_out_peers=Set}) ->
+  NewSet = sets:add_element(PeerId, Set),
+  notify_peers_state_changed(Set, NewSet, State),
+  State#state{timed_out_peers=NewSet}.
+
+live_peer(PeerId, State = #state{timed_out_peers=Set}) ->
+  NewSet = sets:del_element(PeerId, Set),
+  notify_peers_state_changed(Set, NewSet, State),
+  State#state{timed_out_peers=NewSet}.
+
+remove_legacy_peers(RemovedPeerSet, State = #state{timed_out_peers=Set}) ->
+  NewSet = sets:subtract(Set, RemovedPeerSet),
+  notify_peers_state_changed(Set, NewSet, State),
+  State#state{timed_out_peers=NewSet}.
+
+notify_peers_state_changed(_OldPeerList, _NewPeerList, #state{notification_module=undefined}) ->
+  ok;
+notify_peers_state_changed(OldPeerList, NewPeerList, _State)
+  when OldPeerList =:= NewPeerList ->
+  ok;
+notify_peers_state_changed(_OldPeerList, NewPeerList, State=#state{notification_module=NotificationModule}) ->
+  FollowerStates = get_follower_states(State, NewPeerList),
+  NotificationModule:peer_availability_changed(FollowerStates),
+  ok.
+
+get_follower_states(#state{followers=Followers}, TimedOutPeers) ->
+  dict:map(fun(Id, _) ->
+               sets:is_element(Id, TimedOutPeers)
+           end,
+           Followers).
 
 %%=============================================================================
 %% Tests
