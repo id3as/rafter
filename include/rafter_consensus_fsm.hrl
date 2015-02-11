@@ -42,7 +42,8 @@
     read_reqs = orddict:new() :: orddict:orddict(),
 
     %% Peers that have heart-beated
-    live_peers = sets:new() :: sets:set(),
+    peer_heartbeats = dict:new() :: dict:dict(),
+    peer_liveness = dict:new() :: dict:dict(),
 
     %% Notififcation support
     notification_module :: atom(),

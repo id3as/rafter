@@ -10,6 +10,7 @@
 -define(ELECTION_TIMEOUT_MIN, 500).
 -define(ELECTION_TIMEOUT_MAX, 1000).
 -define(HEARTBEAT_TIMEOUT, 25).
+-define(PEER_DEAD_TIMEOUT, 500).
 
 %% API
 -export([start_link/3, stop/1, get_leader/1, read_op/2, op/2,
@@ -97,23 +98,19 @@ handle_sync_event(_Event, _From, _StateName, State) ->
 
 handle_info({client_read_timeout, Clock, Id}, StateName,
     #state{read_reqs=Reqs}=State) ->
-        io:format("client read timeout~n"),
-        TrackedState = timeout_peer(Id, State),
         ClientRequests = orddict:fetch(Clock, Reqs),
         {ok, ClientReq} = find_client_req(Id, ClientRequests),
         send_client_timeout_reply(ClientReq),
         NewClientRequests = delete_client_req(Id, ClientRequests),
         NewReqs = orddict:store(Clock, NewClientRequests, Reqs),
-        NewState = TrackedState#state{read_reqs=NewReqs},
+        NewState = State#state{read_reqs=NewReqs},
         {next_state, StateName, NewState};
 
 handle_info({client_timeout, Id}, StateName, #state{client_reqs=Reqs}=State) ->
-    io:format("client timeout~n"),
     case find_client_req(Id, Reqs) of
         {ok, ClientReq} ->
-            TrackedState = timeout_peer(Id, State),
             send_client_timeout_reply(ClientReq),
-            NewState = TrackedState#state{client_reqs=delete_client_req(Id, Reqs)},
+            NewState = State#state{client_reqs=delete_client_req(Id, Reqs)},
             {next_state, StateName, NewState};
         not_found ->
             {next_state, StateName, State}
@@ -362,11 +359,11 @@ leader(timeout, #state{term=Term, init_config=[Id, From], config=C}=S) ->
     NewState = State#state{init_config=complete},
     {next_state, leader, NewState};
 
-%% heartbeat the nodes
-leader(timeout, State0) ->
-    State = reset_timer(heartbeat_timeout(), State0),
-    NewState = heartbeat(State),
-    {next_state, leader, NewState};
+leader(timeout, State) ->
+    State1 = reset_timer(heartbeat_timeout(), State),
+    State2 = send_append_entries(State1),
+    State3 = compute_live_peers(State2),
+    {next_state, leader, State3};
 
 %% We are out of date. Go back to follower state.
 leader(#append_entries_rpy{term=Term, success=false},
@@ -384,7 +381,7 @@ leader(#append_entries_rpy{from=From, success=false},
        #state{followers=Followers, config=C, me=Me}=State) ->
        case lists:member(From, rafter_config:followers(Me, C)) of
            true ->
-               TrackedState = live_peer(From, State),
+               TrackedState = update_peer_heartbeat(From, State),
                NextIndex = decrement_follower_index(From, Followers),
                NewFollowers = dict:store(From, NextIndex, Followers),
                NewState = TrackedState#state{followers=NewFollowers},
@@ -399,7 +396,7 @@ leader(#append_entries_rpy{from=From, success=true}=Rpy,
        #state{followers=Followers, config=C, me=Me}=State) ->
     case lists:member(From, rafter_config:followers(Me, C)) of
         true ->
-            TrackedState = live_peer(From, State),
+            TrackedState = update_peer_heartbeat(From, State),
             NewState = save_rpy(Rpy, TrackedState),
             State2 = maybe_commit(NewState),
             State3 = maybe_send_read_replies(State2),
@@ -550,9 +547,6 @@ save_read_request(ReadRequest, #state{send_clock=Clock,
                 orddict:store(Clock, [ReadRequest], Requests)
         end,
         State#state{read_reqs=NewRequests}.
-
-heartbeat(State=#state{}) ->
-    send_append_entries(State).
 
 send_client_timeout_reply(#client_req{from=From}) ->
     gen_fsm:reply(From, {error, timeout}).
@@ -857,7 +851,8 @@ become_leader(#state{me=Me, term=Term, init_config=InitConfig}=State) ->
     NewState = State#state{leader=Me,
                            responses=dict:new(),
                            followers=initialize_followers(State),
-                           live_peers=sets:new(),
+                           peer_heartbeats=dict:new(),
+                           peer_liveness=dict:new(),
                            send_clock = 0,
                            send_clock_responses = dict:new(),
                            read_reqs = orddict:new()},
@@ -964,37 +959,46 @@ reset_timer(Duration, State=#state{timer=Timer}) ->
     NewTimer = gen_fsm:send_event_after(Duration, timeout),
     State#state{timer=NewTimer}.
 
-timeout_peer(PeerId, State = #state{live_peers=Set}) ->
-  io:format("Timeout ~p~n", [PeerId]),
-  NewSet = sets:del_element(PeerId, Set),
-  notify_peers_state_changed(Set, NewSet, State),
-  State#state{live_peers=NewSet}.
+update_peer_heartbeat(PeerId, State = #state{peer_heartbeats=Dict}) ->
+  NewDict = dict:store(PeerId, get_clock(), Dict),
+  State#state{peer_heartbeats=NewDict}.
 
-live_peer(PeerId, State = #state{live_peers=Set}) ->
-  NewSet = sets:add_element(PeerId, Set),
-  notify_peers_state_changed(Set, NewSet, State),
-  State#state{live_peers=NewSet}.
+remove_legacy_peers(RemovedPeerSet, State = #state{peer_heartbeats=Dict}) ->
+  NewDict = sets:fold(fun(RemovedPeer, UpdatedDict) ->
+                          dict:erase(RemovedPeer, UpdatedDict)
+                      end,
+                      Dict,
+                      RemovedPeerSet),
+  State#state{peer_heartbeats=NewDict}.
 
-remove_legacy_peers(RemovedPeerSet, State = #state{live_peers=Set}) ->
-  NewSet = sets:subtract(Set, RemovedPeerSet),
-  notify_peers_state_changed(Set, NewSet, State),
-  State#state{live_peers=NewSet}.
+compute_live_peers(State = #state{
+                              peer_heartbeats=Heartbeats,
+                              peer_liveness=OldLiveness
+                             }) ->
+  Now = get_clock(),
+  NewLiveness = dict:map(fun(_Id, LastResponse) ->
+                             is_follower_alive(Now, LastResponse)
+                         end,
+                         Heartbeats),
+  notify_peers_state_changed(OldLiveness, NewLiveness, State),
+  State#state{peer_liveness=NewLiveness}.
 
 notify_peers_state_changed(_OldPeerList, _NewPeerList, #state{notification_module=undefined}) ->
   ok;
 notify_peers_state_changed(OldPeerList, NewPeerList, _State)
   when OldPeerList =:= NewPeerList ->
   ok;
-notify_peers_state_changed(_OldPeerList, NewPeerList, State=#state{notification_module=NotificationModule}) ->
-  FollowerStates = get_follower_states(State, NewPeerList),
-  NotificationModule:peer_availability_changed(FollowerStates),
+notify_peers_state_changed(_OldPeerList, NewPeerList, #state{notification_module=NotificationModule}) ->
+  NotificationModule:peer_availability_changed(NewPeerList),
   ok.
 
-get_follower_states(#state{followers=Followers}, LivePeers) ->
-  dict:map(fun(Id, _) ->
-               sets:is_element(Id, LivePeers)
-           end,
-           Followers).
+get_clock() ->
+  {Total, _Delta} = erlang:statistics(wall_clock),
+  Total.
+
+is_follower_alive(Now, It) ->
+  Delta = Now - It,
+  Delta =< ?PEER_DEAD_TIMEOUT.
 
 %%=============================================================================
 %% Tests
