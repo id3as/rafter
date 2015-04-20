@@ -14,7 +14,7 @@
 
 %% API
 -export([start_link/3, stop/1, get_leader/1, read_op/2, op/2,
-         set_config/2, send/2, send_sync/2]).
+         set_config/2, send/2, send_sync/2, get_available_peers/1]).
 
 %% gen_fsm callbacks
 -export([init/1, code_change/4, handle_event/3, handle_info/3,
@@ -40,6 +40,9 @@ read_op(Peer, Command) ->
 
 set_config(Peer, Config) ->
     gen_fsm:sync_send_event(Peer, {set_config, Config}).
+
+get_available_peers(Peer) ->
+    gen_fsm:sync_send_event(Peer, get_peer_availability).
 
 get_leader(Pid) ->
     gen_fsm:sync_send_all_state_event(Pid, get_leader).
@@ -132,13 +135,20 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %%=============================================================================
 
 %% Election timeout has expired. Go to candidate state iff we are a voter.
-follower(timeout, #state{config=Config, me=Me}=State0) ->
+follower(timeout, #state{config=Config, me=Me, timer_reset_at=TimerResetAt}=State0) ->
+    TimeSinceLastContact = case TimerResetAt of
+                             undefined -> "never";
+                             _ -> get_clock() - TimerResetAt
+                           end,
+
     case rafter_config:has_vote(Me, Config) of
         false ->
+            lager:info("rafter: election timeout occurred, but we don't have a vote, so staying a follower. Time elapsed since last contact from leader = ~p", [TimeSinceLastContact]),
             State = reset_timer(election_timeout(), State0),
             NewState = State#state{leader=undefined},
             {next_state, follower, NewState};
         true ->
+            lager:info("rafter: election timeout occurred, and we have a vote, becoming a candidate. Time elapsed since last contact from leader = ~p", [TimeSinceLastContact]),
             State = become_candidate(State0),
             {next_state, candidate, State}
     end;
@@ -161,12 +171,13 @@ follower(#append_entries{term=Term}, _From,
 follower(#append_entries{term=Term, from=From, prev_log_index=PrevLogIndex,
                          entries=Entries, commit_index=CommitIndex,
                          send_clock=Clock}=AppendEntries,
-         _From, #state{me=Me}=State) ->
+         _From, #state{me=Me, leader=PreviousLeader}=State) ->
     State2=set_term(Term, State),
     Rpy = #append_entries_rpy{send_clock=Clock,
                               term=Term,
                               success=false,
                               from=Me},
+    maybe_log_leader_changed(PreviousLeader, From),
     %% Always reset the election timer here, since the leader is valid,
     %% but may have conflicting data to sync
     State3 = reset_timer(election_timeout(), State2),
@@ -228,6 +239,10 @@ follower({op, _Command}, _From, #state{me=Me, config=Config,
 
 follower({op, _Command}, _From, #state{leader=Leader}=State) ->
     Reply = {error, {redirect, Leader}},
+    {reply, Reply, follower, State};
+
+follower(get_peer_availability, _From, #state{leader=Leader}=State) ->
+    Reply = {error, {redirect, Leader}},
     {reply, Reply, follower, State}.
 
 %% This is the initial election to set the initial config. We did not
@@ -264,6 +279,7 @@ candidate(#vote{term=VoteTerm, success=false},
 %% We are out of date. Go back to follower state.
 candidate(#vote{term=VoteTerm, success=false}, #state{term=Term}=State)
          when VoteTerm > Term ->
+    lager:info("rafter: received vote with success of false, and a higher term than us, stepping down our candidacy.", []),
     NewState = step_down(VoteTerm, State),
     {next_state, follower, NewState};
 
@@ -273,6 +289,7 @@ candidate(#vote{term=VoteTerm}, #state{term=CurrentTerm}=State)
     {next_state, candidate, State};
 
 candidate(#vote{success=false, from=From}, #state{responses=Responses}=State) ->
+    lager:info("rafter: ~p voted for someone else, c'est la vie", [From]),
     NewResponses = dict:store(From, false, Responses),
     NewState = State#state{responses=NewResponses},
     {next_state, candidate, NewState};
@@ -283,9 +300,11 @@ candidate(#vote{success=true, from=From}, #state{responses=Responses, me=Me,
     NewResponses = dict:store(From, true, Responses),
     case rafter_config:quorum(Me, Config, NewResponses) of
         true ->
+            lager:info("rafter: received a vote from ~p, we have enough votes to become the leader", [From]),
             NewState = become_leader(State),
             {next_state, leader, NewState};
         false ->
+            lager:info("rafter: received a vote from ~p, we don't enough votes to become the leader", [From]),
             NewState = State#state{responses=NewResponses},
             {next_state, candidate, NewState}
     end.
@@ -298,10 +317,12 @@ candidate({set_config, _}, _From, State) ->
 %% If it has a higher term, step down and become follower.
 candidate(#request_vote{term=RequestTerm}=RequestVote, _From,
           #state{term=Term}=State) when RequestTerm > Term ->
+    lager:info("rafter: received a request to vote from ~p, and their term ~p is higher than ours ~p, stepping down.", [_From, RequestTerm, Term]),
     NewState = step_down(RequestTerm, State),
     handle_request_vote(RequestVote, NewState);
-candidate(#request_vote{}, _From, #state{term=CurrentTerm, me=Me}=State) ->
-    Vote = #vote{term=CurrentTerm, success=false, from=Me},
+candidate(#request_vote{term=RequestTerm}, _From, #state{term=Term, me=Me}=State) ->
+    lager:info("rafter: received a request to vote from ~p, but their term ~p isn't higher than ours ~p, nacking them.", [_From, RequestTerm, Term]),
+    Vote = #vote{term=Term, success=false, from=Me},
     {reply, Vote, candidate, State};
 
 %% Another peer is asserting itself as leader, and it must be correct because
@@ -311,6 +332,7 @@ candidate(#request_vote{}, _From, #state{term=CurrentTerm, me=Me}=State) ->
 %% response.
 candidate(#append_entries{term=RequestTerm}, _From,
           #state{init_config=[_, Client]}=State) ->
+    lager:info("rafter: another peer became leader, stepping down our candidacy", []),
     gen_fsm:reply(Client, {error, invalid_initial_config}),
     %% Set to complete, we don't want another misconfiguration
     State2 = State#state{init_config=complete, config=#config{state=blank}},
@@ -320,6 +342,7 @@ candidate(#append_entries{term=RequestTerm}, _From,
 %% Same as the above clause, but we don't need to send an error response.
 candidate(#append_entries{term=RequestTerm}, _From,
           #state{init_config=no_client}=State) ->
+    lager:info("rafter: another peer became leader, stepping down our candidacy", []),
     %% Set to complete, we don't want another misconfiguration
     State2 = State#state{init_config=complete, config=#config{state=blank}},
     State3 = step_down(RequestTerm, State2),
@@ -329,6 +352,7 @@ candidate(#append_entries{term=RequestTerm}, _From,
 %% step down and become follower. Otherwise do nothing
 candidate(#append_entries{term=RequestTerm}, _From, #state{term=CurrentTerm}=State)
         when RequestTerm >= CurrentTerm ->
+    lager:info("rafter: another peer became leader, stepping down our candidacy", []),
     NewState = step_down(RequestTerm, State),
     {next_state, follower, NewState};
 candidate(#append_entries{}, _From, State) ->
@@ -339,6 +363,8 @@ candidate(#append_entries{}, _From, State) ->
 candidate({read_op, _}, _, #state{leader=undefined}=State) ->
     {reply, {error, election_in_progress}, candidate, State};
 candidate({op, _Command}, _From, #state{leader=undefined}=State) ->
+    {reply, {error, election_in_progress}, candidate, State};
+candidate(get_peer_availability, _Fromt, #state{leader=undefined}=State) ->
     {reply, {error, election_in_progress}, candidate, State}.
 
 leader(timeout, #state{term=Term,
@@ -368,6 +394,7 @@ leader(timeout, State) ->
 %% We are out of date. Go back to follower state.
 leader(#append_entries_rpy{term=Term, success=false},
        #state{term=CurrentTerm}=State) when Term > CurrentTerm ->
+    lager:info("rafter: received a request to append entries, our term ~p is not the newest ~p, resigning as leader.", [CurrentTerm, Term]),
     NewState = step_down(Term, State),
     {next_state, follower, NewState};
 
@@ -433,6 +460,7 @@ leader(#append_entries{term=Term}, _From, #state{term=CurrentTerm}=State)
 %% We are out of date. Step down
 leader(#request_vote{term=Term}, _From, #state{term=CurrentTerm}=State)
         when Term > CurrentTerm ->
+    lager:info("rafter: received a request to vote, our term ~p is not the newest ~p, resigning as leader.", [CurrentTerm, Term]),
     NewState = step_down(Term, State),
     {next_state, follower, NewState};
 
@@ -464,7 +492,10 @@ leader({op, {Id, Command}}, From,
         #state{term=Term}=State) ->
     Entry = #rafter_entry{type=op, term=Term, cmd=Command},
     NewState = append(Id, From, Entry, State, leader),
-    {next_state, leader, NewState}.
+    {next_state, leader, NewState};
+
+leader(get_peer_availability, _Fromt, #state{peer_liveness=PeerAvailability}=State) ->
+    {reply, PeerAvailability, leader, State}.
 
 %%=============================================================================
 %% Internal Functions
@@ -753,6 +784,7 @@ handle_request_vote(#request_vote{from=CandidateId, term=Term}=RequestVote,
   State) ->
     State2 = set_term(Term, State),
     {ok, Vote} = vote(RequestVote, State2),
+    lager:info("Received request to vote for ~p, our response is ~p", [CandidateId, lager:pr(Vote, ?MODULE)]),
     case Vote#vote.success of
         true ->
             State3 = set_metadata(CandidateId, State2),
@@ -857,6 +889,8 @@ become_leader(#state{me=Me, term=Term, init_config=InitConfig}=State) ->
                            send_clock_responses = dict:new(),
                            read_reqs = orddict:new()},
 
+    lager:info("rafter: becoming leader - peer heartbeats and liveness cleared", []),
+
     case InitConfig of
         complete ->
             %% Commit a noop entry to the log so we can move the commit index
@@ -957,7 +991,10 @@ heartbeat_timeout() ->
 reset_timer(Duration, State=#state{timer=Timer}) ->
     _ = gen_fsm:cancel_timer(Timer),
     NewTimer = gen_fsm:send_event_after(Duration, timeout),
-    State#state{timer=NewTimer}.
+    State#state{
+      timer = NewTimer,
+      timer_reset_at = get_clock()
+     }.
 
 update_peer_heartbeat(PeerId, State = #state{peer_heartbeats=Dict}) ->
   NewDict = dict:store(PeerId, get_clock(), Dict),
@@ -976,29 +1013,53 @@ compute_live_peers(State = #state{
                               peer_liveness=OldLiveness
                              }) ->
   Now = get_clock(),
-  NewLiveness = dict:map(fun(_Id, LastResponse) ->
-                             is_follower_alive(Now, LastResponse)
+  NewLivenessDetails = dict:map(fun(_Id, LastResponse) ->
+                                    Delta = Now - LastResponse,
+                                    IsAlive = Delta =< ?PEER_DEAD_TIMEOUT,
+
+                                    {IsAlive, Delta, Now, LastResponse}
+                                end,
+                                Heartbeats),
+
+  NewLiveness = dict:map(fun(_Id, {IsAlive, _Delta, _Now, _LastResponse}) ->
+                             IsAlive
                          end,
-                         Heartbeats),
-  notify_peers_state_changed(OldLiveness, NewLiveness, State),
+                         NewLivenessDetails),
+
+  notify_peers_state_changed(OldLiveness, NewLiveness, NewLivenessDetails, State),
   State#state{peer_liveness=NewLiveness}.
 
-notify_peers_state_changed(_OldPeerList, _NewPeerList, #state{notification_module=undefined}) ->
+notify_peers_state_changed(_OldPeerList, _NewPeerList, _NewPeerListDetails, #state{notification_module=undefined}) ->
   ok;
-notify_peers_state_changed(OldPeerList, NewPeerList, _State)
+notify_peers_state_changed(OldPeerList, NewPeerList, _NewPeerListDetails, _State)
   when OldPeerList =:= NewPeerList ->
   ok;
-notify_peers_state_changed(_OldPeerList, NewPeerList, #state{notification_module=NotificationModule}) ->
+notify_peers_state_changed(_OldPeerList, NewPeerList, NewPeerListDetails, #state{notification_module=NotificationModule}) ->
+
+  NewPeerListDetailsList = dict:to_list(NewPeerListDetails),
+
+  lists:foreach(fun({Id, {IsAlive, Delta, Now, LastResponse}}) ->
+               lager:info("rafter: peer ~p liveness is now ~p, time since last heartbeat is ~p, time now is ~p, last heart beat is ~p",
+                           [
+                            Id,
+                            IsAlive,
+                            Delta,
+                            Now,
+                            LastResponse
+                           ])
+           end,
+           NewPeerListDetailsList),
+
   NotificationModule:peer_availability_changed(NewPeerList),
   ok.
+
+maybe_log_leader_changed(PreviousLeader, NewLeader) when PreviousLeader =:= NewLeader -> ok;
+maybe_log_leader_changed(PreviousLeader, NewLeader) ->
+  lager:info("rafter: the leader has changed from ~p to ~p", [PreviousLeader, NewLeader]).
 
 get_clock() ->
   {Total, _Delta} = erlang:statistics(wall_clock),
   Total.
-
-is_follower_alive(Now, It) ->
-  Delta = Now - It,
-  Delta =< ?PEER_DEAD_TIMEOUT.
 
 %%=============================================================================
 %% Tests

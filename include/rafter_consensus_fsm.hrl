@@ -17,6 +17,7 @@
 
     %% Used for Election and Heartbeat timeouts
     timer :: reference(),
+    timer_reset_at :: integer(),
 
     %% leader state: contains nextIndex for each peer
     followers = dict:new() :: dict:dict(),

@@ -6,7 +6,7 @@
 
 %% API
 -export([start_node/2, stop_node/1, op/2, read_op/2, set_config/2,
-         get_leader/1, get_entry/2, get_last_entry/1]).
+         get_leader/1, get_entry/2, get_last_entry/1, get_available_peers/1]).
 
 %% Test API
 -export([start_cluster/0, start_test_node/1]).
@@ -42,6 +42,10 @@ get_entry(Peer, Index) ->
 -spec get_last_entry(peer()) -> term().
 get_last_entry(Peer) ->
     rafter_log:get_last_entry(Peer).
+
+-spec get_available_peers(peer()) -> dict:dict() | {error, {redirect, term()}}.
+get_available_peers(Peer) ->
+  rafter_consensus_fsm:get_available_peers(Peer).
 
 %% =============================================
 %% Test Functions
