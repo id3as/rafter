@@ -11,6 +11,8 @@
 -define(ELECTION_TIMEOUT_MAX, 1000).
 -define(HEARTBEAT_TIMEOUT, 25).
 -define(PEER_DEAD_TIMEOUT, 500).
+-define(LONG_COMMIT_THRESHOLD, 50).
+-define(LONG_NOTIFICATION_THRESHOLD, 50).
 
 %% API
 -export([start_link/3, stop/1, get_leader/1, read_op/2, op/2,
@@ -425,7 +427,10 @@ leader(#append_entries_rpy{from=From, success=true}=Rpy,
         true ->
             TrackedState = update_peer_heartbeat(From, State),
             NewState = save_rpy(Rpy, TrackedState),
+            TimeBefore = get_clock(),
             State2 = maybe_commit(NewState),
+            TimeAfter = get_clock(),
+            maybe_log_long_commit(TimeBefore, TimeAfter),
             State3 = maybe_send_read_replies(State2),
             case State3#state.leader of
                 undefined ->
@@ -1050,12 +1055,28 @@ notify_peers_state_changed(_OldPeerList, NewPeerList, NewPeerListDetails, #state
            end,
            NewPeerListDetailsList),
 
+  TimeBefore = get_clock(),
   NotificationModule:peer_availability_changed(NewPeerList),
+  TimeAfter = get_clock(),
+  maybe_log_long_notification(peer_availability_changed, TimeBefore, TimeAfter),
   ok.
 
 maybe_log_leader_changed(PreviousLeader, NewLeader) when PreviousLeader =:= NewLeader -> ok;
 maybe_log_leader_changed(PreviousLeader, NewLeader) ->
-  lager:info("rafter: the leader has changed from ~p to ~p", [PreviousLeader, NewLeader]).
+  lager:info("rafter: the leader has changed from ~p to ~p", [PreviousLeader, NewLeader]),
+  ok.
+
+maybe_log_long_commit(TimeBefore, TimeAfter) -> maybe_log_long_commit(TimeAfter - TimeBefore).
+maybe_log_long_commit(TimeDelta) when TimeDelta < ?LONG_COMMIT_THRESHOLD -> ok;
+maybe_log_long_commit(_TimeDelta) ->
+  lager:warning("the previous commit took longer than ~pms", [?LONG_COMMIT_THRESHOLD]),
+  ok.
+
+maybe_log_long_notification(WhichNotification, TimeBefore, TimeAfter) -> maybe_log_long_notification(WhichNotification, TimeAfter - TimeBefore).
+maybe_log_long_notification(_WhichNotification, TimeDelta) when TimeDelta < ?LONG_COMMIT_THRESHOLD -> ok;
+maybe_log_long_notification(WhichNotification, _TimeDelta) ->
+  lager:warning("the previous ~p notification took longer than ~pms", [WhichNotification, ?LONG_COMMIT_THRESHOLD]),
+  ok.
 
 get_clock() ->
   {Total, _Delta} = erlang:statistics(wall_clock),
