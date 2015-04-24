@@ -370,25 +370,6 @@ candidate({op, _Command}, _From, #state{leader=undefined}=State) ->
 candidate(get_peer_availability, _Fromt, #state{leader=undefined}=State) ->
     {reply, {error, election_in_progress}, candidate, State}.
 
-leader(timeout, #state{term=Term,
-                       init_config=no_client,
-                       config=C}=S) ->
-    Entry = #rafter_entry{type=config, term=Term, cmd=C},
-    State0 = append(Entry, S),
-    State = reset_timer(heartbeat_timeout(), State0),
-    NewState = State#state{init_config=complete},
-    {next_state, leader, NewState};
-
-%% We have just been elected leader because of an initial configuration.
-%% Append the initial config and set init_config=complete.
-leader(timeout, #state{term=Term, init_config=[Id, From], config=C}=S) ->
-    lager:info("became leader because of an initial configuration, committing initial configuration"),
-    State0 = reset_timer(heartbeat_timeout(), S),
-    Entry = #rafter_entry{type=config, term=Term, cmd=C},
-    State = append(Id, From, Entry, State0, leader),
-    NewState = State#state{init_config=complete},
-    {next_state, leader, NewState};
-
 leader(timeout, State) ->
     State1 = reset_timer(heartbeat_timeout(), State),
     State2 = send_append_entries(State1),
@@ -886,34 +867,40 @@ become_candidate(#state{term=CurrentTerm, me=Me}=State0) ->
     _ = request_votes(State3),
     State3.
 
-become_leader(#state{me=Me, term=Term, init_config=InitConfig}=State) ->
-  LeaderState0 = State#state{leader=Me,
-                             responses=dict:new(),
-                             followers=initialize_followers(State),
-                             peer_heartbeats=dict:new(),
-                             peer_liveness=dict:new(),
-                             send_clock = 0,
-                             send_clock_responses = dict:new(),
-                             read_reqs = orddict:new()},
-
+become_leader(#state{me=Me, term=Term, config=Config, init_config=InitConfig, timer=Timer}=State) ->
+  NewState0 = State#state{leader=Me,
+                          responses=dict:new(),
+                          followers=initialize_followers(State),
+                          send_clock = 0,
+                          send_clock_responses = dict:new(),
+                          read_reqs = orddict:new(),
+                          timer = Timer},
 
   lager:info("rafter: becoming leader - peer heartbeats and liveness cleared", []),
 
-  LeaderState1 = case InitConfig of
-                   complete ->
-                     %% Commit a noop entry to the log so we can move the commit index
-                     Entry = #rafter_entry{type=noop, term=Term, cmd=noop},
-                     append(Entry, LeaderState0);
-                   _ ->
-                     %% First entry must always be a config entry
-                     LeaderState0
-                 end,
-
-  %% As soon as the state flips, we want to cause a timeout
-  %% so that we do our initial append, otherwise it won't
-  %% happen until after another election timeout, which is
-  %% just nonsense
-  reset_timer(0, LeaderState1).
+  case InitConfig of
+    complete ->
+      %% Commit a noop entry to the log so we can move the commit index
+      Entry = #rafter_entry{type=noop, term=Term, cmd=noop},
+      append(Entry, NewState0);
+    undefined ->
+      %% Same as above, but we received our config from another node
+      Entry = #rafter_entry{type=noop, term=Term, cmd=noop},
+      NewState1 = append(Entry, NewState0),
+      NewState1#state{init_config=complete};
+    [Id, From] ->
+      %% Initial config, append it, and set init_config=complete
+      Entry = #rafter_entry{type=config, term=Term, cmd=Config},
+      NewState1 = append(Id, From, Entry, NewState0, leader),
+      NewState2 = reset_timer(heartbeat_timeout(), NewState1),
+      NewState2#state{init_config=complete};
+    no_client ->
+      %% Same as above, but no-one to tell
+      Entry = #rafter_entry{type=config, term=Term, cmd=Config},
+      NewState1 = append(Entry, NewState0),
+      NewState2 = reset_timer(heartbeat_timeout(), NewState1),
+      NewState2#state{init_config=complete}
+  end.
 
 initialize_followers(#state{me=Me, config=Config}) ->
     Peers = rafter_config:followers(Me, Config),
