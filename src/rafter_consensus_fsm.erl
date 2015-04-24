@@ -168,6 +168,7 @@ follower(#request_vote{}=RequestVote, _From, State) ->
 follower(#append_entries{term=Term}, _From,
          #state{term=CurrentTerm, me=Me}=State) when CurrentTerm > Term ->
     Rpy = #append_entries_rpy{from=Me, term=CurrentTerm, success=false},
+    lager:info("received append_entries with a term ~p, which is higher than ours ~p", [Term, CurrentTerm]),
     {reply, Rpy, follower, State};
 
 follower(#append_entries{term=Term, from=From, prev_log_index=PrevLogIndex,
@@ -381,6 +382,7 @@ leader(timeout, #state{term=Term,
 %% We have just been elected leader because of an initial configuration.
 %% Append the initial config and set init_config=complete.
 leader(timeout, #state{term=Term, init_config=[Id, From], config=C}=S) ->
+    lager:info("became leader because of an initial configuration, committing initial configuration"),
     State0 = reset_timer(heartbeat_timeout(), S),
     Entry = #rafter_entry{type=config, term=Term, cmd=C},
     State = append(Id, From, Entry, State0, leader),
@@ -885,27 +887,33 @@ become_candidate(#state{term=CurrentTerm, me=Me}=State0) ->
     State3.
 
 become_leader(#state{me=Me, term=Term, init_config=InitConfig}=State) ->
-    NewState = State#state{leader=Me,
-                           responses=dict:new(),
-                           followers=initialize_followers(State),
-                           peer_heartbeats=dict:new(),
-                           peer_liveness=dict:new(),
-                           send_clock = 0,
-                           send_clock_responses = dict:new(),
-                           read_reqs = orddict:new()},
+  LeaderState0 = State#state{leader=Me,
+                             responses=dict:new(),
+                             followers=initialize_followers(State),
+                             peer_heartbeats=dict:new(),
+                             peer_liveness=dict:new(),
+                             send_clock = 0,
+                             send_clock_responses = dict:new(),
+                             read_reqs = orddict:new()},
 
-    lager:info("rafter: becoming leader - peer heartbeats and liveness cleared", []),
 
-    case InitConfig of
-        complete ->
-            %% Commit a noop entry to the log so we can move the commit index
-            Entry = #rafter_entry{type=noop, term=Term, cmd=noop},
-            append(Entry, NewState);
-        _ ->
-            %% First entry must always be a config entry
-            NewState
-    end.
+  lager:info("rafter: becoming leader - peer heartbeats and liveness cleared", []),
 
+  LeaderState1 = case InitConfig of
+                   complete ->
+                     %% Commit a noop entry to the log so we can move the commit index
+                     Entry = #rafter_entry{type=noop, term=Term, cmd=noop},
+                     append(Entry, LeaderState0);
+                   _ ->
+                     %% First entry must always be a config entry
+                     LeaderState0
+                 end,
+
+  %% As soon as the state flips, we want to cause a timeout
+  %% so that we do our initial append, otherwise it won't
+  %% happen until after another election timeout, which is
+  %% just nonsense
+  reset_timer(0, LeaderState1).
 
 initialize_followers(#state{me=Me, config=Config}) ->
     Peers = rafter_config:followers(Me, Config),
